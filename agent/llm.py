@@ -18,7 +18,8 @@ class LLM(Protocol):
 
 class OllamaLLM:
     def __init__(self, model: str | None = None, host: str | None = None,
-                 temperature: float = 0.1, num_ctx: int = 8192):
+                 temperature: float = 0.1, num_ctx: int = 4096, think: bool = False):
+        self.think = think
         self.model = model or os.getenv("OLLAMA_MODEL", "gemma4:latest")
         self.host = host or os.getenv("OLLAMA_HOST", "http://localhost:11434")
         self.options = {"temperature": temperature, "num_ctx": num_ctx}
@@ -36,7 +37,13 @@ class OllamaLLM:
             kwargs["tools"] = tools
         if schema:
             kwargs["format"] = schema  # structured output
-        resp = self._client.chat(**kwargs)
+        # Reasoning ("thinking") models are ~6x slower and add nothing for simple classification.
+        try:
+            resp = self._client.chat(**kwargs, think=self.think)
+        except ollama.ResponseError as exc:
+            if "think" not in str(exc).lower():
+                raise
+            resp = self._client.chat(**kwargs)  # model doesn't support the think flag
         msg = resp["message"] if isinstance(resp, dict) else resp.message
         get = (lambda k, d=None: msg.get(k, d)) if isinstance(msg, dict) else (lambda k, d=None: getattr(msg, k, d))
         calls = []

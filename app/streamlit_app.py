@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -46,6 +47,77 @@ def run(fn):
     return asyncio.run(_go())
 
 
+PRIORITY_ICON = {"Low": "🟢", "Medium": "🟡", "High": "🟠", "Urgent": "🔴"}
+
+
+def clean(wrapped) -> str:
+    """Unwrap {'content': '<untrusted_ticket_content>..'} to plain text for display."""
+    text = wrapped.get("content", "") if isinstance(wrapped, dict) else (wrapped or "")
+    return text.replace("<untrusted_ticket_content>", "").replace("</untrusted_ticket_content>", "").strip()
+
+
+def fmt_dt(value: str | None) -> str:
+    if not value:
+        return "-"
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone().strftime("%d %b %Y, %H:%M")
+    except ValueError:
+        return value
+
+
+def render_ticket(detail: dict, llm, llm_ok: bool) -> None:
+    if "error" in detail:
+        st.error(f"{detail['error']['code']}: {detail['error']['message']}")
+        return
+    t = detail["ticket"]
+    st.subheader(f"#{t['id']}  {clean(t['subject'])}")
+    c1, c2, c3, c4 = st.columns(4)
+    for col, label, value in (
+        (c1, "Status", t["status_label"] or "-"),
+        (c2, "Priority", f"{PRIORITY_ICON.get(t['priority_label'], '')} {t['priority_label'] or '-'}"),
+        (c3, "Created", fmt_dt(t["created_at"])),
+        (c4, "Updated", fmt_dt(t["updated_at"])),
+    ):
+        col.caption(label)
+        col.markdown(f"**{value}**")  # body-sized, so it stays smaller than the ticket heading
+    req = t.get("requester") or {}
+    st.markdown(
+        f"**Requester:** {req.get('name') or '-'} &nbsp;|&nbsp; {req.get('email') or '-'} &nbsp;|&nbsp; {req.get('phone') or '-'}"
+        f"  \n**Tags:** {' '.join(f'`{x}`' for x in t['tags']) or '-'}"
+        f"  \n**Due by:** {fmt_dt(t.get('due_by'))}" + ("  \n:red[**Escalated**]" if t.get("is_escalated") else "")
+    )
+
+    # --- agent summary
+    st.markdown("#### Agent summary")
+    if st.button("Summarize with agent", disabled=not llm_ok, key=f"sum{t['id']}"):
+        with st.spinner("Summarizing with the local model..."):
+            st.session_state.summary = (t["id"], triage_agent.summarize_ticket(llm, t))
+    summary = st.session_state.get("summary")
+    if summary and summary[0] == t["id"]:
+        st.info(summary[1])
+    elif not llm_ok:
+        st.caption("Ollama is not available; see the sidebar.")
+
+    # --- description + thread
+    st.markdown("#### Description")
+    desc = t.get("description") or {}
+    st.text(clean(desc) or "(empty)")
+    if desc.get("truncated"):
+        st.caption("Description truncated by the connector.")
+    convs = t.get("conversations") or []
+    st.markdown(f"#### Conversation ({len(convs)})")
+    if not convs:
+        st.caption("No replies or notes yet.")
+    for c in convs:
+        who = "user" if c["from"] == "customer" else "assistant"
+        with st.chat_message(who):
+            label = "Customer" if c["from"] == "customer" else "Agent"
+            st.caption(f"{label}{' (private note)' if c['private'] else ''} - {fmt_dt(c['created_at'])}")
+            st.write(clean(c["body"]) or "(empty)")
+    with st.expander("Raw JSON"):
+        st.json(detail)
+
+
 tab_tickets, tab_triage, tab_health = st.tabs(["Tickets", "Triage Copilot", "Connector health"])
 
 # ----------------------------------------------------------------- tickets
@@ -73,8 +145,10 @@ with tab_tickets:
         pick = st.selectbox("Ticket detail", [t["id"] for t in tickets])
         if st.button("Show detail"):
             st.session_state.detail = run(lambda b: b.call("get_ticket", {"ticket_id": pick, "include_conversations": True}))
-        if st.session_state.get("detail"):
-            st.json(st.session_state.detail)
+            st.session_state.pop("summary", None)
+        detail = st.session_state.get("detail")
+        if detail:
+            render_ticket(detail, llm, ok)
 
 # ----------------------------------------------------------------- triage
 with tab_triage:
