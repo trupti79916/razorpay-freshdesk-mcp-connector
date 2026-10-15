@@ -1,0 +1,152 @@
+"""Minimal Streamlit UI: Tickets, Triage Copilot (human approval), Connector health.
+
+Run: uv run streamlit run app/streamlit_app.py
+The UI is just another MCP client: it spawns the Freshdesk MCP server over stdio.
+"""
+from __future__ import annotations
+
+import asyncio
+import sys
+from pathlib import Path
+
+import pandas as pd
+import streamlit as st
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from agent import triage_agent  # noqa: E402
+from agent.llm import OllamaLLM  # noqa: E402
+from agent.mcp_bridge import connect  # noqa: E402
+from freshdesk_mcp.guardrails import AuditLog  # noqa: E402
+
+st.set_page_config(page_title="Freshdesk Triage Copilot", layout="wide")
+st.title("Support Triage Copilot")
+st.caption("Freshdesk MCP connector + local Ollama model. Writes are gated: dry-run, then human approval.")
+
+# ----------------------------------------------------------------- sidebar
+with st.sidebar:
+    st.header("Settings")
+    model = st.text_input("Ollama model", value=OllamaLLM().model)
+    llm = OllamaLLM(model=model)
+    ok, msg = llm.health()
+    st.success("Ollama ready") if ok else st.error(msg)
+    if llm.is_cloud:
+        st.warning("Cloud model: ticket text leaves this machine.")
+    write_mode = st.toggle("Enable write mode (WRITE_ENABLED)", value=False,
+                           help="Lets the server execute approved private notes / priority / tag updates.")
+    limit = st.slider("Tickets per triage run", 1, 15, 6)
+
+
+def run(fn):
+    """Open an MCP session, run `fn(bridge)`, return its result."""
+    async def _go():
+        async with connect(write_enabled=write_mode) as bridge:
+            return await fn(bridge)
+    return asyncio.run(_go())
+
+
+tab_tickets, tab_triage, tab_health = st.tabs(["Tickets", "Triage Copilot", "Connector health"])
+
+# ----------------------------------------------------------------- tickets
+with tab_tickets:
+    c1, c2, c3 = st.columns(3)
+    status = c1.selectbox("Status", [None, 2, 3, 4], format_func=lambda s: {None: "Any", 2: "Open", 3: "Pending", 4: "Resolved"}[s])
+    priority = c2.selectbox("Priority", [None, 1, 2, 3, 4], format_func=lambda s: {None: "Any", 1: "Low", 2: "Medium", 3: "High", 4: "Urgent"}[s])
+    query = c3.text_input("Search query (optional)", placeholder="status:2 AND tag:'refund'")
+    if st.button("Load tickets"):
+        async def _load(b):
+            if query:
+                return await b.call("search_tickets", {"query": query})
+            return await b.call("list_tickets", {"status": status, "priority": priority, "per_page": 30})
+        data = run(_load)
+        if "error" in data:
+            st.error(data["error"])
+        else:
+            st.session_state.tickets = data["tickets"]
+    tickets = st.session_state.get("tickets", [])
+    if tickets:
+        df = pd.DataFrame([{"id": t["id"], "subject": t["subject"].replace("<untrusted_ticket_content>\n", "").replace("\n</untrusted_ticket_content>", ""),
+                            "status": t["status_label"], "priority": t["priority_label"], "tags": ", ".join(t["tags"]),
+                            "updated": t["updated_at"]} for t in tickets])
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        pick = st.selectbox("Ticket detail", [t["id"] for t in tickets])
+        if st.button("Show detail"):
+            st.session_state.detail = run(lambda b: b.call("get_ticket", {"ticket_id": pick, "include_conversations": True}))
+        if st.session_state.get("detail"):
+            st.json(st.session_state.detail)
+
+# ----------------------------------------------------------------- triage
+with tab_triage:
+    st.markdown("Classifies open tickets with the local model, then **proposes** a private note, tags and a priority raise. "
+                "Nothing is written until you click Approve.")
+    if st.button("Run triage", type="primary", disabled=not ok):
+        box = st.empty()
+        run_log: list[str] = []
+
+        def progress(m: str):
+            run_log.append(m)
+            box.info(m)
+
+        st.session_state.triage = run(lambda b: triage_agent.run_triage(b, llm, limit=limit, progress=progress))
+        box.empty()
+        st.session_state.pop("done", None)
+
+    items = st.session_state.get("triage", [])
+    done = st.session_state.setdefault("done", {})
+    if items:
+        st.dataframe(pd.DataFrame([{
+            "ticket": i["ticket_id"], "category": i["result"]["category"], "urgency": i["result"]["urgency"],
+            "current": i["current_priority"], "source": i["source"],
+            "injection?": i["result"]["injection_suspected"], "reason": i["result"]["reason"],
+        } for i in items if "result" in i]), use_container_width=True, hide_index=True)
+        for i in items:
+            if "result" not in i:
+                st.error(f"#{i['ticket_id']}: {i['error']}")
+                continue
+            p = i["proposal"]
+            with st.expander(f"#{i['ticket_id']} - {i['result']['category']} / {i['result']['urgency']}"):
+                if i["result"]["injection_suspected"]:
+                    st.warning("Prompt-injection attempt suspected in this ticket.")
+                st.text(p["note"])
+                st.write(f"Priority change: {p['priority'] or 'none'} | Tags: {', '.join(p['add_tags'])}")
+                if not write_mode:
+                    st.info("Write mode is off (see sidebar). Enable it to preview and approve.")
+                    continue
+                if st.button("Preview (dry run)", key=f"pv{p['ticket_id']}"):
+                    st.json(run(lambda b, p=p: triage_agent.preview_proposal(b, p)))
+                if done.get(p["ticket_id"]):
+                    st.success("Applied.")
+                    st.json(done[p["ticket_id"]])
+                else:
+                    a, r = st.columns(2)
+                    if a.button("Approve and apply", key=f"ap{p['ticket_id']}"):
+                        done[p["ticket_id"]] = run(lambda b, p=p: triage_agent.apply_proposal(b, p))
+                        st.rerun()
+                    r.button("Reject", key=f"rj{p['ticket_id']}")
+
+    with st.expander("Ask the assistant (experimental, read-only tools)"):
+        q = st.text_input("Question", placeholder="Which open tickets mention refunds?")
+        if st.button("Ask") and q:
+            trace: list[str] = []
+            answer = run(lambda b: triage_agent.chat(b, llm, q, trace=trace.append))
+            if trace:
+                st.caption("Tool calls: " + " -> ".join(trace))
+            st.write(answer)
+
+# ----------------------------------------------------------------- health
+with tab_health:
+    if st.button("Refresh status"):
+        st.session_state.status = run(lambda b: b.call("get_connector_status", {}))
+        async def _tools(b):
+            return [{"tool": t.name, "read_only": bool(t.annotations and t.annotations.readOnlyHint)} for t in await b.load_tools()]
+        st.session_state.tools = run(_tools)
+    if "status" in st.session_state:
+        st.json(st.session_state.status)
+        st.dataframe(pd.DataFrame(st.session_state.tools), hide_index=True)
+    st.subheader("Last 20 audit entries")
+    entries = AuditLog(str(ROOT / "audit.log.jsonl")).tail(20)
+    if entries:
+        st.dataframe(pd.DataFrame(entries).iloc[::-1], use_container_width=True, hide_index=True)
+    else:
+        st.caption("No calls yet.")

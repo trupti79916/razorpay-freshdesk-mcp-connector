@@ -1,0 +1,32 @@
+[project]
+name = "freshdesk-mcp"
+version = "0.1.0"
+description = "Private Freshdesk MCP connector with guardrails, rate-limit handling and a Streamlit triage copilot"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.9,<2",
+    "httpx>=0.27",
+    "pydantic>=2.6",
+    "python-dotenv>=1.0",
+    "streamlit>=1.38",
+    "ollama>=0.4",
+    "pandas>=2.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "respx>=0.21"]
+
+[project.scripts]
+freshdesk-mcp = "freshdesk_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/freshdesk_mcp"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = ["live: hits the real Freshdesk trial account (set FRESHDESK_LIVE_TEST=1)"]
