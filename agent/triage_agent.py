@@ -137,7 +137,7 @@ async def run_triage(bridge: McpBridge, llm: LLM, limit: int = 8,
             items.append({"ticket_id": summary["id"], "error": full["error"]["message"]})
             continue
         ticket = full["ticket"]
-        say(f"[{n}/{len(batch)}] Classifying ticket #{ticket['id']} with the local model")
+        say(f"[{n}/{len(batch)}] Classifying ticket #{ticket['id']} with the model")
         result, source = classify(llm, _ticket_text(ticket))
         items.append({
             "ticket_id": ticket["id"],

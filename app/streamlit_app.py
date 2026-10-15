@@ -6,6 +6,8 @@ The UI is just another MCP client: it spawns the Freshdesk MCP server over stdio
 from __future__ import annotations
 
 import asyncio
+import hmac
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -17,25 +19,65 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from agent import triage_agent  # noqa: E402
-from agent.llm import OllamaLLM  # noqa: E402
+from agent.llm import PROVIDERS, make_llm  # noqa: E402
 from agent.mcp_bridge import connect  # noqa: E402
 from freshdesk_mcp.guardrails import AuditLog  # noqa: E402
 
 st.set_page_config(page_title="Freshdesk Triage Copilot", layout="wide")
 st.title("Support Triage Copilot")
-st.caption("Freshdesk MCP connector + local Ollama model. Writes are gated: dry-run, then human approval.")
+st.caption("Freshdesk MCP connector + any LLM (local Ollama or a hosted API). "
+           "Writes are gated: dry-run, then human approval.")
+
+# ------------------------------------------------------- optional password gate
+# Set APP_PASSWORD (e.g. as a Replit secret) before exposing this app on a public URL.
+_pw = os.getenv("APP_PASSWORD")
+if _pw and not st.session_state.get("authed"):
+    entered = st.text_input("Password", type="password")
+    if entered and hmac.compare_digest(entered.encode(), _pw.encode()):
+        st.session_state.authed = True
+        st.rerun()
+    elif entered:
+        st.error("Wrong password.")
+    st.stop()
 
 # ----------------------------------------------------------------- sidebar
 with st.sidebar:
+    st.header("LLM")
+    providers = list(PROVIDERS)
+    default_provider = os.getenv("LLM_PROVIDER", "ollama").lower()
+    provider = st.selectbox("Provider", providers,
+                            index=providers.index(default_provider) if default_provider in providers else 0,
+                            help="Anything OpenAI-compatible works via 'custom' (vLLM, LM Studio, proxies...).")
+    preset = PROVIDERS[provider]
+    default_model = os.getenv("LLM_MODEL") or (os.getenv("OLLAMA_MODEL", "gemma4:latest") if provider == "ollama" else "")
+    model = st.text_input("Model", value=default_model, placeholder="e.g. gpt-4o-mini, llama-3.3-70b-versatile")
+    base_url = st.text_input("Base URL", value=os.getenv("LLM_BASE_URL") or preset["base_url"],
+                             help="Defaults to the provider's standard endpoint.")
+    api_key = st.text_input("API key", type="password", value="", placeholder=f"or set {preset['key_hint']}",
+                            help="Kept in this browser session only; never written to disk.")
+    @st.cache_data(ttl=60, show_spinner=False)
+    def _health(provider, model, base_url, api_key):  # avoid hitting the provider on every rerun
+        return make_llm(provider, model or None, base_url or None, api_key or None).health()
+
+    try:
+        llm = make_llm(provider, model or None, base_url or None, api_key or None)
+        ok, msg = _health(provider, model, base_url, api_key)
+    except ValueError as exc:
+        llm, ok, msg = None, False, str(exc)
+    if ok:
+        st.success(f"LLM ready: {provider} / {llm.model}")
+    else:
+        st.error(msg)
+    if llm is not None and llm.is_cloud:
+        st.warning("Remote model: ticket text is sent to this provider.")
+
     st.header("Settings")
-    model = st.text_input("Ollama model", value=OllamaLLM().model)
-    llm = OllamaLLM(model=model)
-    ok, msg = llm.health()
-    st.success("Ollama ready") if ok else st.error(msg)
-    if llm.is_cloud:
-        st.warning("Cloud model: ticket text leaves this machine.")
-    write_mode = st.toggle("Enable write mode (WRITE_ENABLED)", value=False,
-                           help="Lets the server execute approved private notes / priority / tag updates.")
+    can_write = os.getenv("DISABLE_WRITE_MODE", "").lower() not in {"1", "true", "yes"}
+    write_mode = can_write and st.toggle(
+        "Enable write mode (WRITE_ENABLED)", value=False,
+        help="Lets the server execute approved private notes / priority / tag updates.")
+    if not can_write:
+        st.caption("Write mode is disabled on this deployment.")
     limit = st.slider("Tickets per triage run", 1, 15, 6)
 
 
@@ -90,7 +132,7 @@ def render_ticket(detail: dict, llm, llm_ok: bool) -> None:
     # --- agent summary
     st.markdown("#### Agent summary")
     if st.button("Summarize with agent", disabled=not llm_ok, key=f"sum{t['id']}"):
-        with st.spinner("Summarizing with the local model..."):
+        with st.spinner("Summarizing with the model..."):
             st.session_state.summary = (t["id"], triage_agent.summarize_ticket(llm, t))
     summary = st.session_state.get("summary")
     if summary and summary[0] == t["id"]:
@@ -152,7 +194,7 @@ with tab_tickets:
 
 # ----------------------------------------------------------------- triage
 with tab_triage:
-    st.markdown("Classifies open tickets with the local model, then **proposes** a private note, tags and a priority raise. "
+    st.markdown("Classifies open tickets with the selected model, then **proposes** a private note, tags and a priority raise. "
                 "Nothing is written until you click Approve.")
     if st.button("Run triage", type="primary", disabled=not ok):
         box = st.empty()

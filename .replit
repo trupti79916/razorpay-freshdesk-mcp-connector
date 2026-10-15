@@ -1,0 +1,9 @@
+modules = ["python-3.12"]
+run = "pip install -q -e . && streamlit run app/streamlit_app.py --server.port 8501 --server.address 0.0.0.0 --server.headless true"
+
+[[ports]]
+localPort = 8501
+externalPort = 80
+
+[deployment]
+run = ["sh", "-c", "pip install -q -e . && streamlit run app/streamlit_app.py --server.port 8501 --server.address 0.0.0.0 --server.headless true"]

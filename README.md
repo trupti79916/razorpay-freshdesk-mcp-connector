@@ -14,6 +14,30 @@ A private [MCP](https://modelcontextprotocol.io) connector for Freshdesk, built 
 4. Seed demo data: `uv run python scripts/seed_tickets.py` (15 Razorpay-themed tickets; `--bulk 40` adds filler, `--dry-run` previews).
 5. Run the UI: `uv run streamlit run app/streamlit_app.py`.
 
+## Choosing an LLM
+
+The MCP connector needs no LLM. Only the demo agent does, and it works with any model:
+
+| Provider | `LLM_PROVIDER` | Notes |
+|---|---|---|
+| Local Ollama (default) | `ollama` | `LLM_MODEL` or `OLLAMA_MODEL`, e.g. `gemma4:latest` |
+| Ollama hosted API | `ollama` + `LLM_BASE_URL` + `LLM_API_KEY` | verify the endpoint with Ollama's docs |
+| OpenAI, Groq, OpenRouter, Together, Gemini | `openai`, `groq`, `openrouter`, `together`, `gemini` | set `LLM_MODEL` and the key (`LLM_API_KEY` or e.g. `OPENAI_API_KEY`) |
+| LM Studio, vLLM, any OpenAI-compatible server | `lmstudio` / `custom` | set `LLM_BASE_URL` |
+
+You can also pick the provider, model, base URL and API key in the UI sidebar (the key stays in the browser session). Structured output degrades gracefully (`json_schema`, then `json_object`, then plain JSON in the prompt), and triage falls back to a keyword classifier if the model fails. Remote providers receive ticket text; the sidebar warns when you pick one.
+
+## Deploy on Replit
+
+Replit cannot reach an Ollama running on your laptop, so use a hosted provider (or tunnel your Ollama and set `OLLAMA_HOST`).
+
+1. Import this repo into Replit (from GitHub).
+2. Under **Secrets** add `FRESHDESK_DOMAIN`, `FRESHDESK_API_KEY`, `LLM_PROVIDER`, `LLM_MODEL`, the LLM key, and **`APP_PASSWORD`**. Do not use a `.env` file.
+3. For a public deployment also set `DISABLE_WRITE_MODE=true` unless you really want approvals from the web.
+4. Press Run. The `.replit` file installs the package and starts Streamlit on port 8501. The MCP server runs as a subprocess of the UI.
+
+Without `APP_PASSWORD`, anyone with the URL can read your tickets. Replit's filesystem can be ephemeral, so `audit.log.jsonl` may reset on redeploy.
+
 ## Run the MCP server on its own
 
 ```bash
